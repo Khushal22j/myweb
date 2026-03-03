@@ -1,265 +1,330 @@
-#!/usr/bin/env python3
 """
-Mock Data Generator — CLI Entry Point
-
-Usage:
-    python main.py --schema schema.xlsx --rows 1000
-    python main.py --schema schema.xlsx --rows 500 --output ./output
-    python main.py --schema schema.xlsx --rows CUSTOMERS:500,ORDERS:2000
-    python main.py --schema schema.xlsx --rows 1000 --seed 42 --null-pct 0.03
-    python main.py --schema schema.xlsx --rows 1000 --validate
+Mock Data Engine — orchestrates data generation with:
+  - Primary key uniqueness (single and composite)
+  - Foreign key referential integrity
+  - Unique constraint enforcement
+  - Semantic-aware value generation
+  - NULL distribution based on schema definitions
+  - Production-quality realistic data
 """
 
-import argparse
-import csv
-import json
-import os
-import sys
-import time
-from pathlib import Path
-from typing import Dict, List
+import random
+import uuid
+import datetime
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from schema_parser import SchemaParser, TableDef
-from engine import MockDataEngine
-
-
-# ---------------------------------------------------------------------------
-# CSV writer
-# ---------------------------------------------------------------------------
-
-def write_csv(rows: List[Dict], path: str):
-    if not rows:
-        Path(path).touch()
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()),
-                                quoting=csv.QUOTE_NONNUMERIC,
-                                extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+from schema_parser import ColumnDef, TableDef
+from generator import (
+    _detect_semantic, _gen_semantic, _gen_by_dtype, _weighted_none,
+    _rand_date, _rand_datetime
+)
 
 
 # ---------------------------------------------------------------------------
-# Validation report
+# Key registry — tracks generated keys for FK / uniqueness enforcement
 # ---------------------------------------------------------------------------
 
-def validate_output(tables: Dict[str, List[Dict]], schema: Dict[str, TableDef]) -> Dict:
-    report = {"tables": {}, "summary": {"total_issues": 0}}
+class KeyRegistry:
+    def __init__(self):
+        # table_name -> column_name -> set of generated values
+        self._pk_store: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        # table_name -> set of tuple(values) for composite PKs
+        self._composite_pk_store: Dict[str, Set[tuple]] = defaultdict(set)
+        # table_name -> column_name -> set of generated values (unique cols)
+        self._unique_store: Dict[str, Dict[str, Set]] = defaultdict(lambda: defaultdict(set))
 
-    for tname, rows in tables.items():
-        tdef = schema.get(tname.lower())
-        issues = []
+    def register_pk(self, table: str, col: str, value: Any):
+        self._pk_store[table][col].append(value)
 
-        if not tdef:
-            continue
+    def register_composite_pk(self, table: str, key_tuple: tuple):
+        self._composite_pk_store[table].add(key_tuple)
 
-        # Build column index
-        col_map = {c.name.lower(): c for c in tdef.columns}
+    def composite_pk_exists(self, table: str, key_tuple: tuple) -> bool:
+        return key_tuple in self._composite_pk_store[table]
 
-        # Check primary key uniqueness
-        for pk_col in tdef.primary_keys:
-            pk_vals = [r.get(pk_col.name) for r in rows]
-            duplicates = len(pk_vals) - len(set(pk_vals))
-            if duplicates > 0:
-                issues.append(f"PK '{pk_col.name}': {duplicates} duplicate(s)")
+    def get_pk_values(self, table: str, col: str) -> list:
+        return self._pk_store[table][col]
 
-        # Check NOT NULL constraints
-        for col in tdef.columns:
-            if not col.nullable and not col.is_primary_key:
-                nulls = sum(1 for r in rows if r.get(col.name) is None)
-                if nulls > 0:
-                    issues.append(f"NOT NULL '{col.name}': {nulls} NULL(s) found")
+    def register_unique(self, table: str, col: str, value: Any):
+        self._unique_store[table][col].add(value)
 
-        # Check FK referential integrity
-        fk_pools: Dict[str, set] = {}
-        for tbl_name2, rows2 in tables.items():
-            t2 = schema.get(tbl_name2.lower())
-            if t2:
-                for pk_col in t2.primary_keys:
-                    key = f"{tbl_name2.lower()}.{pk_col.name.lower()}"
-                    fk_pools[key] = {r.get(pk_col.name) for r in rows2}
+    def unique_exists(self, table: str, col: str, value: Any) -> bool:
+        return value in self._unique_store[table][col]
 
-        for fk_col in tdef.foreign_keys:
-            if not fk_col.ref_table or not fk_col.ref_column:
+    def has_pk_values(self, table: str, col: str) -> bool:
+        return bool(self._pk_store[table][col])
+
+
+# ---------------------------------------------------------------------------
+# Primary key generators
+# ---------------------------------------------------------------------------
+
+def _gen_pk_value(col: ColumnDef, row_idx: int, counter: int) -> Any:
+    """Generate a guaranteed-unique primary key value."""
+    dt = (col.data_type or "").upper()
+
+    if "UUID" in dt or "GUID" in dt or "UNIQUEIDENTIFIER" in dt:
+        return str(uuid.uuid4())
+
+    if any(x in dt for x in ["INT","SERIAL","BIGINT","NUMBER","NUMERIC","SMALLINT"]):
+        return counter + 1
+
+    if any(x in dt for x in ["CHAR","VARCHAR","TEXT","STRING"]):
+        name_prefix = col.name.upper()[:3].replace(" ", "")
+        return f"{name_prefix}{counter + 1:08d}"
+
+    if "UUID" in col.name.upper() or "GUID" in col.name.upper():
+        return str(uuid.uuid4())
+
+    return counter + 1
+
+
+# ---------------------------------------------------------------------------
+# Main generator
+# ---------------------------------------------------------------------------
+
+class MockDataEngine:
+
+    def __init__(self, tables: List[TableDef], row_counts: Dict[str, int],
+                 null_probability: float = 0.05, seed: Optional[int] = None):
+        self.tables = {t.name.lower(): t for t in tables}
+        self.row_counts = {k.lower(): v for k, v in row_counts.items()}
+        self.null_prob = null_probability
+        self.registry = KeyRegistry()
+        if seed is not None:
+            random.seed(seed)
+
+        # Build topological order
+        self._order = self._topological_sort()
+
+    # ------------------------------------------------------------------
+    # Topological sort for FK dependency resolution
+    # ------------------------------------------------------------------
+
+    def _topological_sort(self) -> List[str]:
+        """Sort tables so parent tables are generated before child tables."""
+        deps: Dict[str, Set[str]] = {}
+        for tname, tdef in self.tables.items():
+            dep_set = set()
+            for col in tdef.foreign_keys:
+                if col.ref_table:
+                    ref = col.ref_table.lower()
+                    if ref in self.tables and ref != tname:
+                        dep_set.add(ref)
+            deps[tname] = dep_set
+
+        ordered = []
+        visited = set()
+        in_progress = set()
+
+        def visit(n):
+            if n in visited:
+                return
+            if n in in_progress:
+                # Circular FK — skip (will use None for unresolvable FK)
+                return
+            in_progress.add(n)
+            for dep in deps.get(n, set()):
+                visit(dep)
+            in_progress.discard(n)
+            visited.add(n)
+            ordered.append(n)
+
+        for tname in self.tables:
+            visit(tname)
+
+        return ordered
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_all(self) -> Dict[str, List[Dict]]:
+        """Generate mock data for all tables. Returns dict of table_name -> rows."""
+        results = {}
+        for tname in self._order:
+            if tname not in self.tables:
                 continue
-            pool_key = f"{fk_col.ref_table.lower()}.{fk_col.ref_column.lower()}"
-            pool = fk_pools.get(pool_key)
-            if pool is None:
-                continue
-            orphans = sum(
-                1 for r in rows
-                if r.get(fk_col.name) is not None          # NULL FK is valid (optional ref)
-                and str(r.get(fk_col.name)) not in {str(p) for p in pool}
-            )
-            if orphans > 0:
-                issues.append(f"FK '{fk_col.name}' → {fk_col.ref_table}.{fk_col.ref_column}: {orphans} orphan(s)")
+            n = self.row_counts.get(tname, 100)
+            tdef = self.tables[tname]
+            rows = self._generate_table(tdef, n)
+            results[tname] = rows
+        return results
 
-        report["tables"][tname] = {
-            "row_count": len(rows),
-            "issues": issues,
-            "status": "PASS" if not issues else "FAIL"
+    # ------------------------------------------------------------------
+    # Table generation
+    # ------------------------------------------------------------------
+
+    def _generate_table(self, tdef: TableDef, n: int) -> List[Dict]:
+        rows = []
+        # Per-column counters for PK sequences
+        pk_counters: Dict[str, int] = defaultdict(int)
+        # Track unique values per column within this table
+        unique_seen: Dict[str, Set] = defaultdict(set)
+        # Track composite PK tuples
+        composite_pk_seen: Set[tuple] = set()
+
+        composite_groups = tdef.composite_key_groups
+        composite_col_names = {
+            col.name
+            for cols in composite_groups.values()
+            for col in cols
         }
-        report["summary"]["total_issues"] += len(issues)
 
-    report["summary"]["status"] = "PASS" if report["summary"]["total_issues"] == 0 else "FAIL"
-    return report
+        for i in range(n):
+            row = {}
 
+            # ---- Pass 1: Generate all non-composite-PK columns ----
+            for col in tdef.columns:
+                if col.name in composite_col_names:
+                    continue  # handled separately
 
-# ---------------------------------------------------------------------------
-# Parse row counts argument
-# ---------------------------------------------------------------------------
+                value = self._gen_column_value(
+                    col, tdef.name, i, pk_counters, unique_seen
+                )
+                row[col.name] = value
 
-def parse_row_counts(raw: str, table_names: List[str]) -> Dict[str, int]:
-    """
-    Accepts:
-      - "500"           → all tables get 500
-      - "CUSTOMERS:500,ORDERS:2000"  → per-table
-    """
-    if ":" in raw:
-        result = {}
-        for part in raw.split(","):
-            part = part.strip()
-            if ":" in part:
-                tbl, cnt = part.split(":", 1)
-                result[tbl.strip().lower()] = int(cnt.strip())
-        # Fill missing tables with 100
-        for t in table_names:
-            if t.lower() not in result:
-                result[t.lower()] = 100
-        return result
-    else:
-        n = int(raw)
-        return {t.lower(): n for t in table_names}
+            # ---- Pass 2: Composite key columns ----
+            for group_name, group_cols in composite_groups.items():
+                max_attempts = 100
+                for attempt in range(max_attempts):
+                    combo = {}
+                    for col in group_cols:
+                        combo[col.name] = self._gen_column_value(
+                            col, tdef.name, i, pk_counters, unique_seen
+                        )
+                    key_tuple = tuple(combo[c.name] for c in group_cols)
+                    if key_tuple not in composite_pk_seen:
+                        composite_pk_seen.add(key_tuple)
+                        self.registry.register_composite_pk(tdef.name.lower(), key_tuple)
+                        row.update(combo)
+                        break
+                else:
+                    # Fallback: append row index to first column
+                    for col in group_cols:
+                        row[col.name] = f"{i}_{random.randint(0,99999)}"
 
+            rows.append(row)
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+            # Register PKs for FK use
+            for col in tdef.primary_keys:
+                if col.name in row and row[col.name] is not None:
+                    self.registry.register_pk(tdef.name.lower(), col.name.lower(), row[col.name])
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate production-quality mock data from a Collibra Excel schema.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
-    )
-    parser.add_argument("--schema", required=True,
-                        help="Path to the Collibra Excel schema file (.xlsx)")
-    parser.add_argument("--rows", default="100",
-                        help="Number of rows per table, or TABLE:N,TABLE2:N2 format")
-    parser.add_argument("--output", default="./output",
-                        help="Output directory for CSV files (default: ./output)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--null-pct", type=float, default=0.05,
-                        help="Probability of NULL for nullable columns (default: 0.05)")
-    parser.add_argument("--validate", action="store_true",
-                        help="Run validation after generation and print report")
-    parser.add_argument("--format", choices=["csv","json","both"], default="csv",
-                        help="Output format (default: csv)")
-    parser.add_argument("--list-tables", action="store_true",
-                        help="List tables found in schema and exit")
+        return rows
 
-    args = parser.parse_args()
+    # ------------------------------------------------------------------
+    # Column value generation
+    # ------------------------------------------------------------------
 
-    # ---- Parse schema ----
-    print(f"\n{'='*60}")
-    print("  Mock Data Generator — Collibra Schema")
-    print(f"{'='*60}")
-    print(f"\n[1/4] Parsing schema: {args.schema}")
+    def _gen_column_value(
+        self,
+        col: ColumnDef,
+        table_name: str,
+        row_idx: int,
+        pk_counters: Dict[str, int],
+        unique_seen: Dict[str, Set],
+    ) -> Any:
 
-    try:
-        sp = SchemaParser()
-        tables = sp.parse_excel(args.schema)
-    except Exception as e:
-        print(f"\n✗ Schema parse error: {e}", file=sys.stderr)
-        sys.exit(1)
+        # ---- Primary Key ----
+        if col.is_primary_key:
+            pk_counters[col.name] += 1
+            value = _gen_pk_value(col, row_idx, pk_counters[col.name] - 1)
+            self.registry.register_unique(table_name.lower(), col.name.lower(), value)
+            return value
 
-    print(f"  ✓ Found {len(tables)} table(s):")
-    for t in tables:
-        pks = [c.name for c in t.primary_keys]
-        fks = [f"{c.name}→{c.ref_table}" for c in t.foreign_keys]
-        print(f"    • {t.schema}.{t.name} ({len(t.columns)} cols | PKs: {pks} | FKs: {fks})")
+        # ---- Foreign Key ----
+        if col.is_foreign_key and col.ref_table:
+            value = self._resolve_fk(col, row_idx)
+            if value is not None:
+                return value
+            # FK pool empty (e.g. self-referencing on first row): return NULL if nullable
+            if col.nullable:
+                return None
+            # Not nullable and no pool yet — will be NULL, but can't do better
 
-    if args.list_tables:
-        sys.exit(0)
+        # ---- Nullable with NULL injection ----
+        null_pct = self.null_prob if col.nullable else 0.0
+        # Columns with "NOT NULL" semantics
+        if not col.nullable:
+            null_pct = 0.0
 
-    # ---- Row counts ----
-    table_names = [t.name for t in tables]
-    try:
-        row_counts = parse_row_counts(args.rows, table_names)
-    except ValueError as e:
-        print(f"\n✗ Invalid --rows argument: {e}", file=sys.stderr)
-        sys.exit(1)
+        # ---- Default value ----
+        if col.default_value is not None and random.random() < 0.1:
+            return col.default_value
 
-    print(f"\n[2/4] Generating data:")
-    for t in tables:
-        n = row_counts.get(t.name.lower(), 100)
-        print(f"    • {t.name}: {n:,} rows")
+        # ---- Allowed values (enum) ----
+        if col.allowed_values:
+            value = random.choice(col.allowed_values)
+            if null_pct and random.random() < null_pct:
+                return None
+            return value
 
-    start = time.time()
+        # ---- Semantic detection ----
+        semantic = _detect_semantic(col.name, col.data_type)
+        if semantic:
+            value = _gen_semantic(semantic, row_idx, col.name)
+            if value is None:
+                value = _gen_by_dtype(
+                    col.name, col.data_type, col.length,
+                    col.precision, col.scale,
+                    col.min_value, col.max_value, col.allowed_values
+                )
+        else:
+            value = _gen_by_dtype(
+                col.name, col.data_type, col.length,
+                col.precision, col.scale,
+                col.min_value, col.max_value, col.allowed_values
+            )
 
-    # ---- Generate ----
-    engine = MockDataEngine(
-        tables=tables,
-        row_counts=row_counts,
-        null_probability=args.null_pct,
-        seed=args.seed,
-    )
+        # ---- Unique constraint enforcement ----
+        if (col.is_unique or col.is_primary_key) and value is not None:
+            max_attempts = 1000
+            for _ in range(max_attempts):
+                if not self.registry.unique_exists(table_name.lower(), col.name.lower(), value):
+                    break
+                # Regenerate
+                if semantic:
+                    value = _gen_semantic(semantic, row_idx + random.randint(1, 9999), col.name)
+                else:
+                    value = _gen_by_dtype(
+                        col.name, col.data_type, col.length,
+                        col.precision, col.scale,
+                        col.min_value, col.max_value, col.allowed_values
+                    )
+            self.registry.register_unique(table_name.lower(), col.name.lower(), value)
 
-    try:
-        all_data = engine.generate_all()
-    except Exception as e:
-        print(f"\n✗ Generation error: {e}", file=sys.stderr)
-        import traceback; traceback.print_exc()
-        sys.exit(1)
+        # ---- Apply NULL probability ----
+        if null_pct and random.random() < null_pct:
+            return None
 
-    elapsed = time.time() - start
-    total_rows = sum(len(v) for v in all_data.values())
-    print(f"\n  ✓ Generated {total_rows:,} total rows in {elapsed:.2f}s")
+        return value
 
-    # ---- Write output ----
-    os.makedirs(args.output, exist_ok=True)
-    print(f"\n[3/4] Writing output to: {args.output}/")
+    # ------------------------------------------------------------------
+    # Foreign key resolution
+    # ------------------------------------------------------------------
 
-    for tname, rows in all_data.items():
-        if args.format in ("csv", "both"):
-            out_path = os.path.join(args.output, f"{tname}.csv")
-            write_csv(rows, out_path)
-            sz = os.path.getsize(out_path)
-            print(f"    • {tname}.csv  ({len(rows):,} rows, {sz/1024:.1f} KB)")
+    def _resolve_fk(self, col: ColumnDef, row_idx: int) -> Any:
+        """Return a value from the referenced table's PK pool."""
+        ref_tbl = col.ref_table.lower() if col.ref_table else None
+        ref_col = col.ref_column.lower() if col.ref_column else None
 
-        if args.format in ("json", "both"):
-            out_path = os.path.join(args.output, f"{tname}.json")
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(rows, f, indent=2, default=str)
-            print(f"    • {tname}.json  ({len(rows):,} rows)")
+        if not ref_tbl:
+            return None
 
-    # ---- Validation ----
-    if args.validate:
-        print(f"\n[4/4] Validating constraints...")
-        schema_map = {t.name.lower(): t for t in tables}
-        report = validate_output(all_data, schema_map)
+        # Try exact ref_col first
+        if ref_col and self.registry.has_pk_values(ref_tbl, ref_col):
+            pool = self.registry.get_pk_values(ref_tbl, ref_col)
+            return random.choice(pool)
 
-        for tname, tinfo in report["tables"].items():
-            status_icon = "✓" if tinfo["status"] == "PASS" else "✗"
-            print(f"    {status_icon} {tname}: {tinfo['row_count']:,} rows — {tinfo['status']}")
-            for issue in tinfo["issues"]:
-                print(f"      ⚠ {issue}")
+        # Try to find any PK of the referenced table
+        if ref_tbl in self.tables:
+            ref_tdef = self.tables[ref_tbl]
+            for pk_col in ref_tdef.primary_keys:
+                if self.registry.has_pk_values(ref_tbl, pk_col.name.lower()):
+                    pool = self.registry.get_pk_values(ref_tbl, pk_col.name.lower())
+                    return random.choice(pool)
 
-        # Write validation report
-        report_path = os.path.join(args.output, "_validation_report.json")
-        with open(report_path, "w") as f:
-            json.dump(report, f, indent=2)
-        print(f"\n  Validation report: {report_path}")
-        print(f"  Overall: {report['summary']['status']} "
-              f"({report['summary']['total_issues']} issue(s))")
-    else:
-        print(f"\n[4/4] Skipping validation (use --validate to enable)")
-
-    print(f"\n{'='*60}")
-    print(f"  Done! Output in: {os.path.abspath(args.output)}/")
-    print(f"{'='*60}\n")
-
-
-if __name__ == "__main__":
-    main()
+        # No data yet generated for referenced table (e.g. self-referencing FK on first row)
+        return None
